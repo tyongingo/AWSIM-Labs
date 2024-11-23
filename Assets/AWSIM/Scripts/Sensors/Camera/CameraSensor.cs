@@ -1,7 +1,13 @@
 using System;
+using System.Collections;
+using System.Collections.Generic;
 using AWSIM.Scripts.UI;
 using UnityEngine;
 using UnityEngine.Rendering;
+using UnityEngine.Profiling;
+//using UnityEditor.PackageManager.Requests;
+using UnityEngine.PlayerLoop;
+using System.Threading;
 
 namespace AWSIM
 {
@@ -155,6 +161,10 @@ namespace AWSIM
 
         private int bytesPerPixel = 3;
 
+        private CameraSensorHolder multiCameraHolder;
+
+        private CommandBuffer cmd;
+
         private void Start()
         {
             if (cameraObject == null)
@@ -184,6 +194,7 @@ namespace AWSIM
             cameraObject.usePhysicalProperties = true;
             UpdateCameraParameters();
             UpdateRenderTexture();
+            //UpdateRenderTexture_test();
             ConfigureDistortionShaderBuffers();
             distortionShader.GetKernelThreadGroupSizes(shaderKernelIdx,
                 out var distortionShaderThreadsPerGroupX, out var distortionShaderthreadsPerGroupY, out _);
@@ -195,14 +206,24 @@ namespace AWSIM
             rosImageShaderGroupSizeX = ((cameraParameters.width * cameraParameters.height) * sizeof(uint)) / ((int)rosImageShaderThreadsPerGroupX * sizeof(uint));
 
             uiCameraBridge = gameObject.GetComponent<UICameraBridge>();
+
+            multiCameraHolder = GetComponentInParent<CameraSensorHolder>();
+
+            // コマンドバッファの初期化
+            cmd = new CommandBuffer();
+            cmd.name = "Render and Execute Shaders";
         }
 
         public void DoRender()
         {
             // Render Unity Camera
+            Profiler.BeginSample("Render Unity Camera");
             cameraObject.Render();
+            multiCameraHolder.renderRequestedCount++;
+            Profiler.EndSample();
 
             // Set data to shader
+            Profiler.BeginSample("Execute Shader");
             UpdateShaderParameters();
             distortionShader.SetTexture(shaderKernelIdx, "_InputTexture", targetRenderTexture);
             distortionShader.SetTexture(shaderKernelIdx, "_DistortedTexture", distortedRenderTexture);
@@ -210,11 +231,14 @@ namespace AWSIM
             rosImageShader.SetTexture(rosShaderKernelIdx, "_InputTexture", distortedRenderTexture);
             rosImageShader.SetBuffer(rosShaderKernelIdx, "_RosImageBuffer", computeBuffer);
             rosImageShader.Dispatch(rosShaderKernelIdx, rosImageShaderGroupSizeX, 1, 1);
+            multiCameraHolder.setShaderCount++;
 
             // Get data from shader
             AsyncGPUReadback.Request(computeBuffer, OnGPUReadbackRequest);
+            multiCameraHolder.shaderRequestedCount++;
+            Profiler.EndSample();
 
-            // Callback called once the AsyncGPUReadback request is fulfilled.
+            // Callback called once the AsyncGPUReadback request is fullfield.
             void OnGPUReadbackRequest(AsyncGPUReadbackRequest request)
             {
                 if (request.hasError)
@@ -223,18 +247,258 @@ namespace AWSIM
                     return;
                 }
                 request.GetData<byte>().CopyTo(outputData.imageDataBuffer);
+                multiCameraHolder.renderedCount++;
+                multiCameraHolder.shadedCount++;
+                Debug.Log("Rendered");
+                Debug.Log("Shaded");
             }
 
             // Update output data.
             outputData.cameraParameters = cameraParameters;
 
             // Call registered callback.
+            Profiler.BeginSample("ROS2 Publish");
             OnOutputData.Invoke(outputData);
+            multiCameraHolder.publishedCount++;
+            Profiler.EndSample();
+        }
+
+        public void DoRender_Optimized(bool useCommandBuffer)
+        {   
+            if(useCommandBuffer)
+            {
+                // コマンドバッファのクリア
+                cmd.Clear();
+
+                // Unityカメラのレンダリング
+                cmd.BeginSample("Render Unity Camera");
+                cameraObject.Render();
+                multiCameraHolder.renderRequestedCount++;
+                cmd.EndSample("Render Unity Camera");
+
+                UpdateShaderParameters();
+
+                // 歪みシェーダの実行
+                cmd.BeginSample("Execute Distortion Shader");
+                cmd.SetComputeTextureParam(distortionShader, shaderKernelIdx, "_InputTexture", targetRenderTexture);
+                cmd.SetComputeTextureParam(distortionShader, shaderKernelIdx, "_DistortedTexture", distortedRenderTexture);
+                cmd.DispatchCompute(distortionShader, shaderKernelIdx, distortionShaderGroupSizeX, distortionShaderGroupSizeY, 1);
+                cmd.EndSample("Execute Distortion Shader");
+
+                // ROSイメージシェーダの実行
+                cmd.BeginSample("Execute ROS Image Shader");
+                cmd.SetComputeTextureParam(rosImageShader, rosShaderKernelIdx, "_InputTexture", distortedRenderTexture);
+                cmd.SetComputeBufferParam(rosImageShader, rosShaderKernelIdx, "_RosImageBuffer", computeBuffer);
+                cmd.DispatchCompute(rosImageShader, rosShaderKernelIdx, rosImageShaderGroupSizeX, 1, 1);
+                multiCameraHolder.setShaderCount++;
+                cmd.EndSample("Execute ROS Image Shader");
+
+                // シェーダのデータ取得
+                cmd.BeginSample("Get Data from Shader");
+                var shaderRequest = AsyncGPUReadback.Request(computeBuffer, OnGPUReadbackRequest_Shader);
+                cmd.EndSample("Get Data from Shader");
+
+                // コマンドバッファの実行
+                Graphics.ExecuteCommandBuffer(cmd);
+
+                // コルーチンの開始
+                StartCoroutine(UpdateRequest(shaderRequest));
+            }
+            else
+            {
+                // Render Unity Camera
+                Profiler.BeginSample("Render Unity Camera");
+                cameraObject.Render();
+                multiCameraHolder.renderRequestedCount++;
+                //var renderRequest = AsyncGPUReadback.Request(targetRenderTexture, 0, TextureFormat.ARGB32, OnGPUReadbackRequest_Render);
+                Profiler.EndSample();
+                //StartCoroutine(UpdateRequest(renderRequest));
+
+                // Set data to shader
+                UpdateShaderParameters();
+                Profiler.BeginSample("Execute Distortion Shader");
+                distortionShader.SetTexture(shaderKernelIdx, "_InputTexture", targetRenderTexture);
+                distortionShader.SetTexture(shaderKernelIdx, "_DistortedTexture", distortedRenderTexture);
+                distortionShader.Dispatch(shaderKernelIdx, distortionShaderGroupSizeX, distortionShaderGroupSizeY, 1);
+                //var distortionRequest = AsyncGPUReadback.Request(distortedRenderTexture, 0, TextureFormat.ARGB32, OnGPUReadbackRequest_Distortion);
+                //GL.Flush();
+                Profiler.EndSample();
+                //StartCoroutine(UpdateRequest(distortionRequest));
+                Profiler.BeginSample("Execute ROS Image Shader");
+                rosImageShader.SetTexture(rosShaderKernelIdx, "_InputTexture", distortedRenderTexture);
+                rosImageShader.SetBuffer(rosShaderKernelIdx, "_RosImageBuffer", computeBuffer);
+                rosImageShader.Dispatch(rosShaderKernelIdx, rosImageShaderGroupSizeX, 1, 1);
+                multiCameraHolder.setShaderCount++;
+
+                // Get data from shader
+                var shaderRequest = AsyncGPUReadback.Request(computeBuffer, OnGPUReadbackRequest_Shader);
+                GL.Flush();
+                multiCameraHolder.shaderRequestedCount++;
+                Profiler.EndSample();
+                StartCoroutine(UpdateRequest(shaderRequest));
+                //Thread.Sleep(35);
+            }
+
+            // Callback called once the AsyncGPUReadback request is fullfield.
+            void OnGPUReadbackRequest_Render(AsyncGPUReadbackRequest request)
+            {
+                if (request.hasError)
+                {
+                    Debug.LogWarning("AsyncGPUReadback error");
+                    return;
+                }
+                multiCameraHolder.renderedCount++;
+                Debug.Log("Rendered");
+            }
+
+            void OnGPUReadbackRequest_Sharpen(AsyncGPUReadbackRequest request)
+            {
+                if (request.hasError)
+                {
+                    Debug.LogWarning("AsyncGPUReadback error");
+                    return;
+                }
+                Debug.Log("Sharpened");
+            }
+
+            void OnGPUReadbackRequest_Distortion(AsyncGPUReadbackRequest request)
+            {
+                if (request.hasError)
+                {
+                    Debug.LogWarning("AsyncGPUReadback error");
+                    return;
+                }
+                Debug.Log("Distorted");
+            }
+
+            void OnGPUReadbackRequest_Shader(AsyncGPUReadbackRequest request)
+            {
+                if (request.hasError)
+                {
+                    Debug.LogWarning("AsyncGPUReadback error");
+                    return;
+                }
+                request.GetData<byte>().CopyTo(outputData.imageDataBuffer);
+                multiCameraHolder.renderedCount++;
+                multiCameraHolder.shadedCount++;
+                Debug.Log("Rendered");
+                Debug.Log("Shaded");
+
+                // Call registered callback.
+                Profiler.BeginSample("ROS2 Publish");
+                OnOutputData.Invoke(outputData);
+                multiCameraHolder.publishedCount++;
+                Profiler.EndSample();
+            }
+
+            // Update output data.
+            outputData.cameraParameters = cameraParameters;
+        }
+
+        public IEnumerator DoRender_test()
+        {   
+            // Render Unity Camera
+            Profiler.BeginSample("Render Unity Camera");
+            cameraObject.Render();
+            multiCameraHolder.renderRequestedCount++;
+            //var renderRequest = AsyncGPUReadback.Request(targetRenderTexture, 0, TextureFormat.ARGB32, OnGPUReadbackRequest_Render);
+            Profiler.EndSample();
+            //StartCoroutine(UpdateRequest(renderRequest));
+            //yield return StartCoroutine(UpdateRequest(renderRequest));
+
+            // Set data to shader
+            UpdateShaderParameters();
+            Profiler.BeginSample("Execute Distortion Shader");
+            distortionShader.SetTexture(shaderKernelIdx, "_InputTexture", targetRenderTexture);
+            distortionShader.SetTexture(shaderKernelIdx, "_DistortedTexture", distortedRenderTexture);
+            distortionShader.Dispatch(shaderKernelIdx, distortionShaderGroupSizeX, distortionShaderGroupSizeY, 1);
+            //var distortionRequest = AsyncGPUReadback.Request(distortedRenderTexture, 0, TextureFormat.ARGB32, OnGPUReadbackRequest_Distortion);
+            //GL.Flush();
+            Profiler.EndSample();
+            //yield return StartCoroutine(UpdateRequest(distortionRequest));
+            Profiler.BeginSample("Execute ROS Image Shader");
+            rosImageShader.SetTexture(rosShaderKernelIdx, "_InputTexture", distortedRenderTexture);
+            rosImageShader.SetBuffer(rosShaderKernelIdx, "_RosImageBuffer", computeBuffer);
+            rosImageShader.Dispatch(rosShaderKernelIdx, rosImageShaderGroupSizeX, 1, 1);
+            multiCameraHolder.setShaderCount++;
+
+            // Get data from shader
+            var shaderRequest = AsyncGPUReadback.Request(computeBuffer, OnGPUReadbackRequest_Shader);
+            //GL.Flush();
+            multiCameraHolder.shaderRequestedCount++;
+            Profiler.EndSample();
+            //StartCoroutine(UpdateRequest(shaderRequest));
+            //yield return StartCoroutine(UpdateRequest(shaderRequest));
+
+            // Callback called once the AsyncGPUReadback request is fullfield.
+            void OnGPUReadbackRequest_Render(AsyncGPUReadbackRequest request)
+            {
+                if (request.hasError)
+                {
+                    Debug.LogWarning("AsyncGPUReadback error");
+                    return;
+                }
+                multiCameraHolder.renderedCount++;
+                Debug.Log("Rendered");
+            }
+
+            void OnGPUReadbackRequest_Sharpen(AsyncGPUReadbackRequest request)
+            {
+                if (request.hasError)
+                {
+                    Debug.LogWarning("AsyncGPUReadback error");
+                    return;
+                }
+                Debug.Log("Sharpened");
+            }
+
+            void OnGPUReadbackRequest_Distortion(AsyncGPUReadbackRequest request)
+            {
+                if (request.hasError)
+                {
+                    Debug.LogWarning("AsyncGPUReadback error");
+                    return;
+                }
+                Debug.Log("Distorted");
+            }
+
+            void OnGPUReadbackRequest_Shader(AsyncGPUReadbackRequest request)
+            {
+                if (request.hasError)
+                {
+                    Debug.LogWarning("AsyncGPUReadback error");
+                    return;
+                }
+                request.GetData<byte>().CopyTo(outputData.imageDataBuffer);
+                multiCameraHolder.shadedCount++;
+                Debug.Log("Shaded");
+            }
+
+            // Update output data.
+            outputData.cameraParameters = cameraParameters;
+
+            // Call registered callback.
+            Profiler.BeginSample("ROS2 Publish");
+            OnOutputData.Invoke(outputData);
+            multiCameraHolder.publishedCount++;
+            Profiler.EndSample();
+
+            yield return null;
+        }
+
+        private IEnumerator UpdateRequest(AsyncGPUReadbackRequest request)
+        {
+            while(!request.done)
+            {
+                request.Update();
+                yield return new WaitForFixedUpdate();
+            }
         }
 
         private void OnDestroy()
         {
             computeBuffer.Release();
+            cmd.Release();
         }
 
         private void ConfigureDistortionShaderBuffers()
